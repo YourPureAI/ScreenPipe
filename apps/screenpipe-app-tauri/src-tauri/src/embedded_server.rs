@@ -309,7 +309,7 @@ pub async fn start_embedded_server(
         let db_clone = db.clone();
         let output_path = data_path.to_string_lossy().into_owned();
 
-        let vision_config = config.to_vision_manager_config(output_path, vision_metrics.clone());
+        let vision_config = config.to_vision_manager_config(output_path, vision_metrics.clone(), None);
 
         let vision_manager = Arc::new(
             VisionManager::new(vision_config, db_clone, vision_handle.clone())
