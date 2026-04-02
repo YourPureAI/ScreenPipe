@@ -1,0 +1,213 @@
+name: Build Windows CLI
+
+# Trigger manually from the GitHub Actions UI, or automatically on pushes to main.
+# The artifact (.zip) is uploaded to the workflow run and optionally to a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release with the built artifact'
+        required: false
+        default: 'false'
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      # Only rebuild when Rust sources or dependencies change
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: write   # needed for gh release create
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
+jobs:
+  build-windows:
+    name: Build screenpipe-engine (Windows x86_64)
+    runs-on: windows-2022
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Rust toolchain ───────────────────────────────────────────────────────
+      - name: Set up Rust (stable, MSVC target)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          override: true
+          rustflags: ''
+
+      # ── MSVC environment (cl.exe, link.exe) ──────────────────────────────────
+      - name: Set up MSVC developer tools
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ── Cargo cache ──────────────────────────────────────────────────────────
+      - name: Cache Cargo registry & git db
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-msvc-cargo-
+
+      # ── 7-Zip (needed for packaging) ─────────────────────────────────────────
+      - name: Install 7-Zip
+        shell: pwsh
+        run: |
+          $installer = "7z-installer.exe"
+          Invoke-WebRequest -Uri "https://7-zip.org/a/7z2301-x64.exe" -OutFile $installer
+          Start-Process -FilePath ".\$installer" -Args "/S" -Wait
+          Remove-Item $installer
+          echo "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "C:\Program Files\7-Zip\7z.exe" i | Select-Object -First 3
+
+      # ── ONNX Runtime (required by the 'ort' crate for speaker diarization) ───
+      - name: Download ONNX Runtime (CPU, v1.19.2)
+        shell: pwsh
+        run: |
+          $url    = "https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-win-x64-1.19.2.zip"
+          $zipFile = "onnxruntime-win-x64-1.19.2.zip"
+          $outDir  = "apps/screenpipe-app-tauri/src-tauri"
+          Invoke-WebRequest -Uri $url -OutFile $zipFile
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          7z x $zipFile -o"$outDir" -y | Select-Object -Last 5
+          Write-Host "ORT libs:"
+          Get-ChildItem "$outDir/onnxruntime-win-x64-1.19.2/lib" | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      # ── Bun (needed for setup_openblas.js) ───────────────────────────────────
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      # ── OpenBLAS (required by qwen3-asr / audiopipe) ─────────────────────────
+      - name: Set up OpenBLAS
+        shell: pwsh
+        run: |
+          cd apps/screenpipe-app-tauri
+          bun scripts/setup_openblas.js
+          $openblas = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas"
+          "OPENBLAS_PATH=$openblas" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "OPENBLAS_PATH=$openblas"
+
+      # ── Workaround: shorten target dir to avoid Windows MAX_PATH (260 chars) ──
+      - name: Shorten Cargo target directory (MAX_PATH workaround)
+        shell: pwsh
+        run: |
+          $short = "C:\t"
+          if (Test-Path $short) { Remove-Item -Recurse -Force $short }
+          New-Item -ItemType Directory -Force -Path $short | Out-Null
+          if (Test-Path "target") { Remove-Item -Recurse -Force "target" }
+          cmd /c mklink /J target $short
+          Write-Host "Created junction: target -> $short"
+
+      # ── Cargo build ──────────────────────────────────────────────────────────
+      - name: Build screenpipe-engine (release)
+        env:
+          # ---------- Compiler / linker flags ----------
+          RUSTFLAGS:    '-C link-arg=/LTCG'
+          # Cap at AVX2 — avoids AVX-512 issues on newer Intel/AMD silicon
+          CFLAGS:       '/arch:AVX2'
+          CXXFLAGS:     '/arch:AVX2'
+          CMAKE_ARGS:   >-
+            -DGGML_NATIVE=OFF
+            -DGGML_AVX512=OFF
+            -DGGML_AVX512_VBMI=OFF
+            -DGGML_AVX512_VNNI=OFF
+            -DGGML_AVX512_BF16=OFF
+            -DCMAKE_C_FLAGS=/arch:AVX2
+            -DCMAKE_CXX_FLAGS=/arch:AVX2
+          # ---------- ORT / OpenBLAS ----------
+          ORT_STRATEGY:     system
+          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          OPENBLAS_PATH:    ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
+          # Use prebuilt NASM objects — avoids NASM install on Windows
+          AWS_LC_SYS_PREBUILT_NASM: '1'
+          # ---------- Profile ----------
+          CARGO_PROFILE_RELEASE_STRIP:       'none'
+          CARGO_PROFILE_RELEASE_PANIC:       'abort'
+          CARGO_PROFILE_RELEASE_INCREMENTAL: 'false'
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc `
+            --package screenpipe-engine
+
+      # ── Determine version ─────────────────────────────────────────────────────
+      - name: Read version from Cargo.toml
+        shell: pwsh
+        run: |
+          $content = Get-Content "Cargo.toml" -Raw
+          $ver = if ($content -match 'version\s*=\s*"([^"]+)"') { $Matches[1] } else { "0.0.0" }
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Version: $ver"
+
+      # ── Package ───────────────────────────────────────────────────────────────
+      - name: Create release package (.zip)
+        shell: pwsh
+        run: |
+          $pkg = "screenpipe-${{ env.VERSION }}-x86_64-pc-windows-msvc"
+          New-Item -Path "$pkg/bin" -ItemType Directory -Force | Out-Null
+
+          # Main binary
+          Copy-Item "target/x86_64-pc-windows-msvc/release/screenpipe.exe" "$pkg/bin/"
+
+          # ONNX Runtime DLL (the 'ort' crate may copy it to target/release, fallback to ORT dir)
+          $ortDll = "target/x86_64-pc-windows-msvc/release/onnxruntime.dll"
+          if (-not (Test-Path $ortDll)) {
+            $ortDll = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2/lib/onnxruntime.dll"
+          }
+          Copy-Item $ortDll "$pkg/bin/" -Force
+
+          # OpenBLAS DLLs (libopenblas.dll etc.)
+          $oblasBin = "apps/screenpipe-app-tauri/src-tauri/openblas/bin"
+          if (Test-Path $oblasBin) {
+            Copy-Item "$oblasBin/*.dll" "$pkg/bin/" -Force
+          }
+
+          # MSVC runtime DLLs (onnxruntime depends on dynamic CRT)
+          foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
+            Copy-Item "C:\Windows\System32\$dll" "$pkg/bin/" -Force -ErrorAction SilentlyContinue
+          }
+
+          # Create zip
+          7z a "$pkg.zip" "./$pkg/*"
+          Write-Host "Package: $pkg.zip"
+          Get-ChildItem "$pkg.zip" | Select-Object Name, Length
+
+      # ── Upload artifact to workflow run ───────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenpipe-windows-${{ env.VERSION }}
+          path: screenpipe-*-x86_64-pc-windows-msvc.zip
+          retention-days: 30
+
+      # ── Optional: create GitHub Release ───────────────────────────────────────
+      - name: Create GitHub Release
+        if: github.event.inputs.create_release == 'true' || startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = Get-ChildItem "screenpipe-*-x86_64-pc-windows-msvc.zip" | Select-Object -First 1
+          $tag = if ($env:GITHUB_REF -match "refs/tags/(.+)") { $Matches[1] } else { "build-windows-latest" }
+
+          # Delete the tag+release if it already exists (rolling "latest" release)
+          gh release delete $tag --yes 2>$null
+          git push --delete origin $tag 2>$null
+
+          gh release create $tag `
+            --title "Windows build ${{ env.VERSION }}" `
+            --notes "Automated Windows build of screenpipe-engine v${{ env.VERSION }}.`n`nBuilt from commit ${{ github.sha }}." `
+            --prerelease `
+            $zip.FullName
+
+          Write-Host "Release created: $tag"

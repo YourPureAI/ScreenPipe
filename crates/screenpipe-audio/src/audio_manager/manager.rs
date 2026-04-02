@@ -109,7 +109,13 @@ pub struct CentralHandlerRestartResult {
 impl AudioManager {
     pub async fn new(options: AudioManagerOptions, db: Arc<DatabaseManager>) -> Result<Self> {
         let device_manager = DeviceManager::new().await?;
-        let segmentation_manager = Arc::new(SegmentationManager::new().await?);
+        let segmentation_manager = if options.capture_only {
+            // Capture-only mode: skip model downloads entirely — thin clients
+            // never need speaker diarization.
+            Arc::new(SegmentationManager::disabled())
+        } else {
+            Arc::new(SegmentationManager::new().await?)
+        };
         let status = RwLock::new(AudioManagerStatus::Stopped);
         let vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>> = match options.vad_engine {
             VadEngineEnum::Silero => match SileroVad::new().await {

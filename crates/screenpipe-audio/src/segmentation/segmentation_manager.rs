@@ -25,6 +25,9 @@ pub struct SegmentationManager {
 }
 
 impl SegmentationManager {
+    /// Full initialisation: downloads Pyannote embedding + segmentation models
+    /// if not already cached, then loads them. Use this in `local` and
+    /// `process-only` modes where speaker diarization is needed.
     pub async fn new() -> Result<Self> {
         let embedding_model_path = match get_or_download_model(PyannoteModel::Embedding).await {
             Ok(path) => Some(path),
@@ -75,6 +78,20 @@ impl SegmentationManager {
             embedding_model_path: AsyncMutex::new(embedding_model_path),
             segmentation_model_path: AsyncMutex::new(segmentation_model_path),
         })
+    }
+
+    /// Lightweight stub for capture-only mode.
+    ///
+    /// Returns a `SegmentationManager` with **no models loaded and no
+    /// download attempts**. Speaker diarization calls will silently no-op
+    /// because all model paths are `None`.
+    pub fn disabled() -> Self {
+        SegmentationManager {
+            embedding_manager: Arc::new(StdMutex::new(EmbeddingManager::new(usize::MAX))),
+            embedding_extractor: AsyncMutex::new(None),
+            embedding_model_path: AsyncMutex::new(None),
+            segmentation_model_path: AsyncMutex::new(None),
+        }
     }
 
     /// Re-check model availability and initialize models if they become available.
