@@ -891,11 +891,7 @@ async fn main() -> anyhow::Result<()> {
                 use_pii_removal: config.use_pii_removal,
                 languages: config.languages.clone(),
                 audio_engine: config.audio_transcription_engine.clone(),
-                deepgram_api_key: if config.deepgram_api_key.is_empty() {
-                    None
-                } else {
-                    Some(config.deepgram_api_key.clone())
-                },
+                deepgram_api_key: config.deepgram_api_key.as_ref().filter(|s| !s.is_empty()).cloned(),
                 ..IngestProcessorConfig::default()
             };
             start_ingest_processor(
