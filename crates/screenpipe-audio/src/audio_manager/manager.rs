@@ -110,7 +110,7 @@ impl AudioManager {
     pub async fn new(options: AudioManagerOptions, db: Arc<DatabaseManager>) -> Result<Self> {
         let device_manager = DeviceManager::new().await?;
         let segmentation_manager = if options.capture_only {
-            // Capture-only mode: skip model downloads entirely — thin clients
+            // Capture-only mode: skip model downloads entirely ï¿½ thin clients
             // never need speaker diarization.
             Arc::new(SegmentationManager::disabled())
         } else {
