@@ -1,0 +1,100 @@
+name: macOS E2E Tests
+
+on:
+  schedule:
+    # Run every 4 hours to catch regressions (not on every release — hogs self-hosted runner)
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
+jobs:
+  # ── Tier 1: GitHub hosted runner ──────────────────────────────────────────
+  # Build CLI from source, start server, test API + health
+  # No screen recording or mic — tests what we can without permissions
+  e2e-hosted:
+    name: macOS E2E (hosted)
+    runs-on: macos-14  # M1, Sonoma
+    timeout-minutes: 45
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          echo "hostname: $(hostname)"
+          echo "os:       $(sw_vers -productVersion)"
+          echo "chip:     $(sysctl -n machdep.cpu.brand_string)"
+          echo "memory:   $(sysctl -n hw.memsize | awk '{printf "%.0fGB", $1/1073741824}')"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: brew install ffmpeg pkg-config
+
+      - name: Build CLI
+        run: |
+          cargo build --release -p screenpipe-engine
+          echo "CLI built successfully"
+          ls -la target/release/screenpipe
+
+      - name: Start screenpipe server
+        run: |
+          # Start without screen/audio recording — just the server + API
+          # --disable-vision and --disable-audio to skip permission-gated features
+          ./target/release/screenpipe \
+            --disable-vision \
+            --disable-audio \
+            --port 3030 &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+          echo "server started (PID: $SERVER_PID)"
+
+          # Wait for health API
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3030/health > /dev/null 2>&1; then
+              echo "✓ health API responding"
+              curl -sf http://localhost:3030/health | python3 -m json.tool
+              break
+            fi
+            echo "waiting for health API... ($i/30)"
+            sleep 2
+          done
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run API tests
+        env:
+          ARTIFACTS_DIR: ${{ runner.temp }}/e2e-artifacts
+        run: |
+          mkdir -p "$ARTIFACTS_DIR"
+          bun packages/e2e/src/runner.ts --suite api 2>&1 | tee "${{ runner.temp }}/e2e-full.log"
+
+      - name: Stop server
+        if: always()
+        run: kill $SERVER_PID 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-hosted-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/e2e-artifacts/
+            ${{ runner.temp }}/e2e-full.log
+          retention-days: 14

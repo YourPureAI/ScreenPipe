@@ -1,0 +1,167 @@
+---
+title: "screenpipe MCP server - connect to Claude, Cursor & AI assistants"
+sidebarTitle: "mcp server"
+description: "Set up screenpipe as an MCP server to give Claude, Cursor, and other AI assistants access to your screen history and context."
+icon: "server"
+---
+
+screenpipe provides an MCP (Model Context Protocol) server that lets AI assistants like Claude and Cursor search your screen recordings, audio transcriptions, and control your computer.
+
+## claude desktop
+
+open the **screenpipe app** → **settings** → **connections** → click **"install extension"**
+
+Claude will open and prompt you to confirm. click **install** — done!
+
+try asking Claude: *"what did I do in the last 5 minutes?"*
+
+<Tip>
+make sure screenpipe is running when you use Claude with screenpipe features.
+</Tip>
+
+## claude code
+
+one command:
+
+```bash
+claude mcp add screenpipe --transport stdio -- npx -y screenpipe-mcp
+```
+
+to make it available across all your projects:
+
+```bash
+claude mcp add screenpipe --transport stdio --scope user -- npx -y screenpipe-mcp
+```
+
+verify with `claude mcp list` or `/mcp` inside Claude Code.
+
+## cursor
+
+[click here to install in cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=screenpipe&config=eyJ0eXBlIjoic3RkaW8iLCJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInNjcmVlbnBpcGUtbWNwIl19)
+
+or manually: open **cursor settings** → **mcp** → **add new global mcp server** → set command to `npx` with args `["-y", "screenpipe-mcp"]`.
+
+## other editors (cline, continue, windsurf, etc.)
+
+any editor that supports MCP works with screenpipe. the server command is:
+
+```bash
+npx -y screenpipe-mcp
+```
+
+add this as a stdio MCP server in your editor's MCP settings. see also:
+- [continue setup](/continue)
+- [cline setup](/cline)
+
+## available tools
+
+### search-content (all platforms)
+
+search through recorded screen content, audio transcriptions, and user input events:
+
+| parameter | type | description |
+|-----------|------|-------------|
+| `q` | string | search query (optional - omit to get recent content) |
+| `content_type` | string | `all`, `ocr`, `audio`, `input`, or `accessibility` (default: `all`) |
+| `limit` | integer | max results (default: 10) |
+| `offset` | integer | pagination offset (default: 0) |
+| `start_time` | string | ISO 8601 UTC start time (e.g., `2024-01-15T10:00:00Z`) |
+| `end_time` | string | ISO 8601 UTC end time |
+| `app_name` | string | filter by app (e.g., `Google Chrome`, `Slack`) |
+| `window_name` | string | filter by window title |
+| `min_length` | integer | minimum content length |
+| `max_length` | integer | maximum content length |
+| `include_frames` | boolean | include base64 screenshots (OCR only) |
+| `speaker_ids` | string | comma-separated speaker IDs for audio filtering (e.g., `1,2,3`) |
+| `speaker_name` | string | filter audio by speaker name (case-insensitive partial match) |
+
+### export-video
+
+create video exports from screen recordings for a specific time range:
+
+| parameter | type | description |
+|-----------|------|-------------|
+| `start_time` | string | ISO 8601 UTC start time (required) |
+| `end_time` | string | ISO 8601 UTC end time (required) |
+| `fps` | number | frames per second (default: 1.0) |
+
+## example queries
+
+try these in Claude or Cursor:
+
+- "search for any mentions of 'project' in my screen recordings"
+- "find audio transcriptions from the last hour"
+- "show me what was on my screen in VS Code yesterday"
+- "export a video of my screen from 10am to 11am today"
+- "find what John said in our meeting about the API"
+- "what did I type in Slack today?" (uses content_type=input)
+- "what did I copy to my clipboard recently?" (uses content_type=input)
+
+## testing
+
+test your setup with MCP Inspector:
+
+```bash
+npx @modelcontextprotocol/inspector npx screenpipe-mcp
+```
+
+## requirements
+
+- screenpipe must be running on localhost:3030
+- Node.js >= 18.0.0
+
+## manual config (advanced)
+
+<Expandable title="manual JSON configuration">
+
+if the one-click methods above don't work, you can manually edit config files.
+
+**claude desktop** — edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%AppData%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "screenpipe": {
+      "command": "npx",
+      "args": ["-y", "screenpipe-mcp"]
+    }
+  }
+}
+```
+
+**cursor** — create `.cursor/mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "screenpipe": {
+      "command": "npx",
+      "args": ["-y", "screenpipe-mcp"]
+    }
+  }
+}
+```
+
+**from source:**
+
+```bash
+git clone https://github.com/screenpipe/screenpipe
+cd screenpipe/crates/screenpipe-integrations/screenpipe-mcp
+npm install && npm run build
+```
+
+then point your editor to `node /path/to/screenpipe-mcp/dist/index.js`.
+
+</Expandable>
+
+## troubleshooting
+
+**mcp not connecting?**
+- ensure screenpipe is running (`screenpipe` in terminal)
+- check it's accessible at http://localhost:3030/health
+- restart Claude Desktop / Cursor after config changes
+
+**macos automation not working?**
+- grant accessibility permissions in System Settings > Privacy & Security > Accessibility
+
+still stuck? [ask in our discord](https://discord.gg/screenpipe) — the community can help debug MCP issues.

@@ -1,0 +1,54 @@
+---
+title: "API reference"
+sidebarTitle: "api reference"
+description: "REST API reference for screenpipe: search, frames, audio, tags, and more."
+icon: "code"
+---
+
+screenpipe serves a REST API on `localhost:3030`. use this to integrate with any tool or build custom automations.
+
+<Note>
+for the full interactive API reference with request/response schemas, see the [API reference tab](/api-reference).
+</Note>
+
+## endpoints
+
+| method | endpoint | description |
+| --- | --- | --- |
+| GET | `/search` | search screen & audio content |
+| GET | `/health` | server health check |
+| GET | `/audio/list` | list audio devices |
+| GET | `/vision/list` | list monitors |
+| GET | `/frames/{id}` | get frame data |
+| GET | `/frames/{id}/ocr` | get frame OCR text |
+| POST | `/tags/{type}/{id}` | add tags |
+| DELETE | `/tags/{type}/{id}` | remove tags |
+| POST | `/raw_sql` | execute raw SQL |
+| POST | `/add` | add content to database |
+| GET | `/search/keyword` | keyword search |
+| POST | `/audio/start` | start audio recording |
+| POST | `/audio/stop` | stop audio recording |
+
+## search example
+
+```bash
+curl "http://localhost:3030/search?q=meeting&limit=10&content_type=vision"
+```
+
+## search parameters
+
+| param | type | description |
+| --- | --- | --- |
+| `q` | string | search query |
+| `limit` | int | max results |
+| `offset` | int | pagination offset |
+| `content_type` | string | `vision`, `audio`, `input`, `all` |
+| `start_time` | ISO 8601 | filter start |
+| `end_time` | ISO 8601 | filter end |
+| `app_name` | string | filter by app |
+| `window_name` | string | filter by window title |
+| `browser_url` | string | filter by browser URL |
+| `min_length` | int | minimum text length |
+| `max_length` | int | maximum text length |
+
+need help? [join our discord](https://discord.gg/screenpipe).

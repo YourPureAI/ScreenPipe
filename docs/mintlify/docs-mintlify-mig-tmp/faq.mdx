@@ -1,0 +1,67 @@
+---
+title: "FAQ"
+sidebarTitle: "faq"
+description: "Frequently asked questions about screenpipe."
+icon: "question"
+---
+
+<Expandable title="what are pipes?">
+  pipes are scheduled AI agents that run on your screen data. each pipe is a `.md` file with a prompt and a schedule. an AI agent reads the prompt, queries the screenpipe API, and takes action.
+
+  examples: sync to Obsidian, track time in Toggl, send daily summaries.
+
+  see the [pipes guide](/pipes) for details.
+</Expandable>
+
+<Expandable title="what are the hardware requirements?">
+  - **minimum**: dual-core CPU, 2GB RAM, 20GB disk
+  - **recommended**: quad-core, 4GB+ RAM, 50GB+ SSD
+  - runs 24/7 on a MacBook Pro M3 or a $400 Windows laptop
+  - ~600 MB RAM, ~10% CPU, ~30 GB/month storage at 1 FPS
+</Expandable>
+
+<Expandable title="where is data stored?">
+  all data is in `~/.screenpipe/`:
+  - `db.sqlite` — metadata, OCR text, transcriptions
+  - `data/` — MP4 screen recordings, audio chunks
+  - `pipes/` — installed pipes
+
+  to backup, copy `~/.screenpipe/` to another location.
+</Expandable>
+
+<Expandable title="how do i contribute?">
+  - check [github issues](https://github.com/screenpipe/screenpipe/issues)
+  - join [discord](https://discord.gg/screenpipe)
+  - follow [contribution guidelines](https://github.com/screenpipe/screenpipe/blob/main/CONTRIBUTING.md)
+</Expandable>
+
+<Expandable title="what OCR engines are supported?">
+  `apple-native` (macOS), `windows-native` (Windows), `tesseract` (Linux), `unstructured` (cloud), `custom`
+</Expandable>
+
+<Expandable title="is my data private?">
+  yes. everything runs locally. no data leaves your machine unless you explicitly choose a cloud provider (deepgram, unstructured). you control what's captured with `--ignored-windows` and `--included-windows`.
+</Expandable>
+
+<Expandable title="how do i connect screenpipe to AI?">
+  three ways:
+  1. **MCP server** — works with Claude Desktop, Cursor ([guide](/mcp-server))
+  2. **pipes** — scheduled AI agents ([guide](/pipes))
+  3. **REST API** — `curl http://localhost:3030/search?q=your+query`
+</Expandable>
+
+<Expandable title="music sounds bad or keeps pausing with bluetooth headphones">
+  this is a macOS bluetooth limitation, not a screenpipe bug. when any app opens a bluetooth microphone, macOS switches the headset from the high-quality A2DP codec (stereo, full bass) to the low-quality HFP codec (phone quality, 8kHz mono). this affects all audio — music, ANC, everything. the same thing happens with Zoom, Google Meet, or any app that uses your bluetooth mic.
+
+  **fix:** go to screenpipe settings → audio devices, and switch the input device from your bluetooth headset to your MacBook's built-in microphone. screenpipe will stop opening the bluetooth mic, macOS stays on the high-quality codec, and your music sounds normal again. screenpipe still captures your voice through the built-in mic.
+
+  note: AirPods don't have this issue — Apple uses a proprietary codec that handles input and output simultaneously without switching profiles.
+</Expandable>
+
+<Expandable title="what speech-to-text engines are supported?">
+  **local (default)**: `parakeet` (25 languages, fastest), `whisper-large-v3-turbo` (99 languages), `whisper-tiny` (lightweight)
+
+  **cloud**: `deepgram` / `screenpipe-cloud` (highest accuracy)
+
+  on macOS Apple Silicon, parakeet uses Metal GPU acceleration via MLX for 8x faster transcription.
+</Expandable>

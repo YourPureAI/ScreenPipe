@@ -1,0 +1,92 @@
+---
+title: "cloud archive - free disk space automatically"
+sidebarTitle: "cloud archive"
+description: "Encrypt and archive old screenpipe data to the cloud to free disk space while keeping your history accessible."
+icon: "box-archive"
+---
+
+cloud archive encrypts your old screenpipe data and uploads it to the cloud, then deletes the local copy to free disk space. it uses the same zero-knowledge encryption as [cloud sync](/cloud-sync) — we cannot read your data.
+
+## how it works
+
+<Steps>
+  <Step title="set a retention period">
+    choose how many days of data to keep locally (7, 14, 30, 60, or 90 days). data older than this will be archived.
+  </Step>
+  <Step title="data is encrypted on your device">
+    your token is used to derive an encryption key locally using argon2id. data is encrypted with chacha20-poly1305 before upload — the same encryption used by cloud sync.
+  </Step>
+  <Step title="encrypted data is uploaded in chunks">
+    screenpipe uploads data in small batches (up to 500 records at a time) every 5 minutes. this includes screen captures, ocr text, audio transcriptions, accessibility data, and ui events.
+  </Step>
+  <Step title="local data is cleaned up">
+    after each chunk is confirmed uploaded, the corresponding local data and media files are deleted to free disk space.
+  </Step>
+</Steps>
+
+## what gets archived
+
+<CardGroup cols={2}>
+  <Card title="screen captures" icon="display">
+    frame metadata, app names, window titles, browser urls
+  </Card>
+  <Card title="ocr text" icon="text">
+    extracted text from screen recordings
+  </Card>
+  <Card title="audio transcriptions" icon="microphone">
+    transcribed speech with speaker and device info
+  </Card>
+  <Card title="accessibility data" icon="universal-access">
+    ui text captured via accessibility apis
+  </Card>
+  <Card title="ui events" icon="mouse-pointer">
+    keyboard and mouse activity metadata
+  </Card>
+  <Card title="media files" icon="film">
+    orphaned video/audio files are cleaned up after upload
+  </Card>
+</CardGroup>
+
+## enabling cloud archive
+
+1. open **settings → cloud archive**
+2. select your retention period (how many days to keep locally)
+3. toggle **enable cloud archive**
+
+you can also trigger an immediate archive run by clicking **archive now** in the status card.
+
+## encryption details
+
+cloud archive reuses the same `SyncManager` and encryption pipeline as cloud sync:
+
+- **key derivation**: argon2id with a password derived from your auth token
+- **cipher**: chacha20-poly1305 (authenticated encryption)
+- **zero-knowledge**: the encryption key never leaves your device
+
+if you already have cloud sync enabled, archive uses the exact same encryption key to avoid any conflicts.
+
+<Card title="view archive source code" icon="github" href="https://github.com/screenpipe/screenpipe/blob/main/crates/screenpipe-server/src/archive.rs">
+  review the rust implementation of cloud archive
+</Card>
+
+## watermark-based tracking
+
+instead of marking individual records as uploaded, cloud archive uses a single **watermark timestamp**. all data before the watermark has been securely uploaded and can be safely deleted locally.
+
+this is simpler and more efficient than per-record tracking — one timestamp tells the system exactly where it left off, even if the app restarts.
+
+## storage & limits
+
+your cloud storage usage is shown in the archive status card. storage limits depend on your screenpipe pro plan.
+
+## important notes
+
+<Warning>
+archived data is currently upload-only. download/restore is not yet available — local data older than your retention period will be permanently deleted from your device after upload.
+</Warning>
+
+<Info>
+cloud archive requires a screenpipe pro subscription. the archive process runs automatically in the background every 5 minutes when enabled.
+</Info>
+
+questions? [join our discord](https://discord.gg/screenpipe).

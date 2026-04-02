@@ -1,0 +1,217 @@
+# testing locally with act cli
+
+# act -W .github/workflows/ci.yml --container-architecture linux/amd64 -env ACTIONS_RUNTIME_URL=http://host.docker.internal:8080/ --env ACTIONS_RUNTIME_TOKEN=foo --env ACTIONS_CACHE_URL=http://host.docker.internal:8080/ --artifact-server-path out -j build-ubuntu -P ubuntu-latest=-self-hosted --env-file .env --secret-file .secrets
+
+name: Rust CI
+
+on:
+  push:
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+      - '.github/scripts/**'
+  pull_request:
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+      - '.github/scripts/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
+jobs:
+  test-ubuntu:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          cache: true
+          rustflags: ""
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.2
+
+      - name: Install dependencies
+        run: .github/scripts/install_dependencies.sh
+
+      - name: Copy test image
+        run: |
+          mkdir -p target/debug/deps
+          cp crates/screenpipe-screen/tests/testing_OCR.png target/debug/deps/
+
+      - name: Run cargo tests
+        run: cargo test
+
+  test-windows:
+    runs-on: windows-2019
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\cargo\
+            target\
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust
+        run: |
+          Invoke-WebRequest https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe -OutFile rustup-init.exe
+          .\rustup-init.exe -y
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          cache: true
+          rustflags: ""
+
+      - name: setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.2
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install 7zip
+        shell: powershell
+        run: |
+          $7zipUrl = "https://7-zip.org/a/7z2301-x64.exe"
+          $7zipInstaller = "7z-installer.exe"
+          Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipInstaller
+          Start-Process -FilePath .\$7zipInstaller -Args "/S" -Wait
+          Remove-Item $7zipInstaller
+          echo "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download ONNX Runtime (CPU)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-win-x64-1.19.2.zip"
+          $zipFile = "onnxruntime-win-x64-1.19.2.zip"
+          $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2"
+          Invoke-WebRequest -Uri $url -OutFile $zipFile
+          if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+          7z x $zipFile -o"apps/screenpipe-app-tauri/src-tauri/" -y
+          Write-Host "ONNX Runtime extracted to $extractDir"
+
+      - name: Run pre_build.js
+        shell: bash
+        run: bun ./scripts/pre_build.js
+        working-directory: ./apps/screenpipe-app-tauri
+
+      - name: Copy test image
+        shell: bash
+        run: |
+          mkdir -p target/debug/deps || true
+          cp crates/screenpipe-screen/tests/testing_OCR.png target/debug/deps/
+
+      - name: Run specific Windows OCR cargo test
+        env:
+          RUSTFLAGS: "-C link-arg=/LTCG"
+          ORT_STRATEGY: system
+          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
+          AWS_LC_SYS_PREBUILT_NASM: "1"
+        run: cargo test test_process_ocr_task_windows --release --target x86_64-pc-windows-msvc
+
+      - name: Run PII removal tests
+        env:
+          RUSTFLAGS: "-C link-arg=/LTCG"
+          ORT_STRATEGY: system
+          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
+          AWS_LC_SYS_PREBUILT_NASM: "1"
+        run: cargo test -p screenpipe-core pii_removal --release --target x86_64-pc-windows-msvc
+
+      - name: Run PII redaction tests
+        env:
+          RUSTFLAGS: "-C link-arg=/LTCG"
+          ORT_STRATEGY: system
+          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
+          AWS_LC_SYS_PREBUILT_NASM: "1"
+        run: cargo test -p screenpipe-engine --lib pii_redaction_tests --release --target x86_64-pc-windows-msvc
+
+      # pipes_test removed — pipe manager system deleted in #2212
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\cargo\
+            target\
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          cache: true
+          rustflags: ""
+
+      - name: setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.2
+
+      - name: Run pre_build.js
+        shell: bash
+        env:
+          SKIP_SCREENPIPE_SETUP: true # avoid trying to copy screenpipe binaries, not yet built (next step)
+        run: bun ./scripts/pre_build.js
+        working-directory: ./apps/screenpipe-app-tauri
+
+      - name: Copy test image
+        shell: bash
+        run: |
+          mkdir -p target/debug/deps || true
+          cp crates/screenpipe-screen/tests/testing_OCR.png target/debug/deps/
+
+      - name: Run specific Apple OCR cargo test
+        shell: bash
+        env:
+          DYLD_LIBRARY_PATH: /Users/runner/work/screenpipe/screenpipe/crates/screenpipe-screen/lib
+        # Only test vision package to avoid whisper-rs build issues on macOS CI
+        run: cargo test -p screenpipe-screen test_apple_native_ocr
+
+      - name: Run PII removal tests
+        run: cargo test -p screenpipe-core pii_removal
+
+      # PII redaction tests skipped on macOS due to whisper-rs build issues
+      # - name: Run PII redaction tests
+      #   run: cargo test -p screenpipe-engine --lib pii_redaction_tests

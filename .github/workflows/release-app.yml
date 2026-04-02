@@ -1,0 +1,1249 @@
+# # Run for macOS
+# act -W .github/workflows/release-app.yml --container-architecture linux/amd64 -j publish-tauri -P macos-latest=-self-hosted
+
+name: Release App
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_hash:
+        description: "Commit hash to build from (optional)"
+        required: false
+      version:
+        description: "Version to set in Cargo.toml (required if commit_hash is provided)"
+        required: false
+      needs_testing:
+        description: "Whether this release needs community testing"
+        type: boolean
+        default: false
+      force_github_runners:
+        description: "Force GitHub-hosted runners (skip self-hosted even if online)"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-app-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
+jobs:
+  check_commit:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      should_test: ${{ steps.check.outputs.should_test }}
+      macos_arm_runner: ${{ steps.check-runner.outputs.macos_arm_runner }}
+      windows_runner: ${{ steps.check-runner.outputs.windows_runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: check
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          # Match only when commit message STARTS with these keywords (not mentioned in prose)
+          if echo "$COMMIT_MSG" | head -1 | grep -qE "^(Bump app|release-app)"; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          fi
+          if echo "$COMMIT_MSG" | head -1 | grep -q "^release-app-publish"; then
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Check for explicit testing or skip flags first
+          if echo "$COMMIT_MSG" | head -1 | grep -q "^release-app"; then
+            echo "should_test=true" >> $GITHUB_OUTPUT
+          elif echo "$COMMIT_MSG" | head -1 | grep -q "^release-app-skip-test"; then
+            echo "should_test=false" >> $GITHUB_OUTPUT
+          # For regular release-app (not publish), default to testing=true
+          elif echo "$COMMIT_MSG" | head -1 | grep -q "^release-app" && ! echo "$COMMIT_MSG" | head -1 | grep -q "^release-app-publish"; then
+            echo "should_test=true" >> $GITHUB_OUTPUT
+          # For manual workflow runs, use the input parameter
+          else
+            echo "should_test=${{ github.event.inputs.needs_testing }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check self-hosted runner availability
+        id: check-runner
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_CHECK_TOKEN }}
+        run: |
+          # Check runner: returns "available" (online+idle), "busy" (online+busy), or "offline"
+          check_runner() {
+            local label="$1"
+            local info
+            info=$(gh api repos/${{ github.repository }}/actions/runners \
+              --jq ".runners[] | select(.labels[].name == \"$label\") | {status: .status, busy: .busy}" 2>/dev/null || echo '{"status":"offline","busy":true}')
+            local status=$(echo "$info" | jq -r '.status // "offline"')
+            local busy=$(echo "$info" | jq -r 'if .busy then "true" else "false" end')
+            if [ "$status" = "online" ] && [ "$busy" = "false" ]; then
+              echo "available"
+            elif [ "$status" = "online" ]; then
+              echo "busy"
+            else
+              echo "offline"
+            fi
+          }
+
+          # Wait up to TIMEOUT seconds for a runner to become available
+          # Returns "available" or "timeout"
+          wait_for_runner() {
+            local label="$1"
+            local timeout="$2"
+            local elapsed=0
+            local interval=10
+            echo "⏳ Waiting up to ${timeout}s for $label to become available..." >&2
+            while [ $elapsed -lt $timeout ]; do
+              local state=$(check_runner "$label")
+              if [ "$state" = "available" ]; then
+                echo "available"
+                return
+              elif [ "$state" = "offline" ]; then
+                echo "offline"
+                return
+              fi
+              echo "  $label is busy, waiting... (${elapsed}s/${timeout}s)" >&2
+              sleep $interval
+              elapsed=$((elapsed + interval))
+            done
+            echo "timeout"
+          }
+
+          # Force GitHub-hosted runners if requested
+          if [ "${{ github.event.inputs.force_github_runners }}" = "true" ]; then
+            echo "macos_arm_runner=macos-latest" >> $GITHUB_OUTPUT
+            echo "windows_runner=windows-2022" >> $GITHUB_OUTPUT
+            echo "⚠️ Forcing GitHub-hosted runners (manual override)"
+          else
+            # macOS aarch64: MacBook only (Apple Intelligence requires local Xcode 26 SDK)
+            MACBOOK=$(check_runner "macos-26")
+
+            if [ "$MACBOOK" = "available" ]; then
+              echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
+              echo "✅ MacBook (macos-26) is available"
+            elif [ "$MACBOOK" = "busy" ]; then
+              RESULT=$(wait_for_runner "macos-26" 300)
+              if [ "$RESULT" = "available" ]; then
+                echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
+                echo "✅ MacBook (macos-26) became available"
+              else
+                echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
+                echo "⚠️ MacBook still busy after 5 min — queuing anyway (will wait for runner)"
+              fi
+            else
+              echo "macos_arm_runner=macos-26" >> $GITHUB_OUTPUT
+              echo "⚠️ MacBook offline — job will wait until it comes online"
+            fi
+
+            # Always use GH-hosted Windows — self-hosted is unreliable for builds
+            echo "windows_runner=windows-2022" >> $GITHUB_OUTPUT
+            echo "ℹ️ Using GH-hosted Windows runner (windows-2022)"
+          fi
+
+  draft:
+    needs: [check_commit]
+    if: github.event_name == 'workflow_dispatch' || needs.check_commit.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_hash || github.ref }}
+
+      - name: Update version in Cargo.toml
+        if: github.event.inputs.commit_hash && github.event.inputs.version
+        run: |
+          if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' 's/^version = ".*"/version = "${{ github.event.inputs.version }}"/' apps/screenpipe-app-tauri/src-tauri/Cargo.toml
+          else
+            sed -i 's/^version = ".*"/version = "${{ github.event.inputs.version }}"/' apps/screenpipe-app-tauri/src-tauri/Cargo.toml
+          fi
+
+      - name: draft placeholder
+        run: echo "R2-based releases — no CN draft needed"
+
+  publish-tauri:
+    needs: [check_commit, draft]
+    if: github.event_name == 'workflow_dispatch' || needs.check_commit.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Self-hosted macOS 26 runner (MacBook Pro) for Apple Silicon + Apple Intelligence
+          # Falls back to macos-latest (GH-hosted) if runner is offline
+          - platform: ${{ needs.check_commit.outputs.macos_arm_runner || 'macos-latest' }}
+            args: "--target aarch64-apple-darwin --features metal,parakeet-mlx"
+            target: aarch64-apple-darwin
+            tauri-args: "--target aarch64-apple-darwin --features metal,parakeet-mlx,official-build"
+            os_type: "macos"
+          - platform: "macos-latest"
+            args: "--target x86_64-apple-darwin --features metal"
+            target: x86_64-apple-darwin
+            tauri-args: "--target x86_64-apple-darwin --features metal,official-build"
+            os_type: "macos"
+          - platform: ${{ needs.check_commit.outputs.windows_runner || 'windows-2022' }}
+            args: "--target x86_64-pc-windows-msvc"
+            pre-build-args: ""
+            tauri-args: "--target x86_64-pc-windows-msvc --features official-build,directml"
+            target: x86_64-pc-windows-msvc
+            os_type: "windows"
+          - platform: windows-11-arm
+            args: "--target aarch64-pc-windows-msvc"
+            pre-build-args: ""
+            tauri-args: "--target aarch64-pc-windows-msvc --features official-build,directml"
+            target: aarch64-pc-windows-msvc
+            os_type: "windows"
+          - platform: "ubuntu-24.04"
+            args: "--target x86_64-unknown-linux-gnu"
+            target: x86_64-unknown-linux-gnu
+            tauri-args: "--target x86_64-unknown-linux-gnu --features official-build"
+            os_type: "linux"
+
+    runs-on: ${{ matrix.platform == 'macos-26' && fromJSON('["self-hosted", "macos-26"]') || matrix.platform == 'windows-desktop-test' && fromJSON('["self-hosted", "windows-desktop-test"]') || matrix.platform }}
+    timeout-minutes: 120
+    steps:
+      - name: Detect Xcode version and set Apple Intelligence feature
+        if: matrix.os_type == 'macos'
+        id: detect-xcode
+        shell: bash
+        run: |
+          # Re-enabled: weak-linking fix in binary crate build.rs ensures
+          # FoundationModels.framework is LC_LOAD_WEAK_DYLIB (not LC_LOAD_DYLIB).
+          # DYLD skips the framework on macOS < 26 instead of crashing.
+          # Runtime guard (is_macos_26_or_later) prevents any FFI calls.
+          # Tested: binary built on macOS 26 SDK runs on macOS 15.5 without crash.
+          SDK_PATH=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || echo "")
+          SDK_SETTINGS="${SDK_PATH}/SDKSettings.json"
+          if [ -f "$SDK_SETTINGS" ] && grep -q '"26\.' "$SDK_SETTINGS"; then
+            echo "has_apple_intelligence=true" >> $GITHUB_OUTPUT
+            echo "🧠 macOS 26+ SDK detected — Apple Intelligence enabled"
+          elif [ -d "${SDK_PATH}/System/Library/Frameworks/FoundationModels.framework" ]; then
+            echo "has_apple_intelligence=true" >> $GITHUB_OUTPUT
+            echo "🧠 FoundationModels.framework found — Apple Intelligence enabled"
+          else
+            echo "has_apple_intelligence=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ macOS SDK < 26 — Apple Intelligence not available (stub will be used)"
+          fi
+
+      - name: Enable Git long paths on Windows
+        if: matrix.os_type == 'windows'
+        shell: powershell
+        run: |
+          Write-Host "Enabling git core.longpaths..."
+          # Use --global instead of --system to avoid permission issues on self-hosted runners
+          git config --global core.longpaths true
+          # Verify the setting
+          $longpaths = git config --global --get core.longpaths
+          Write-Host "core.longpaths is set to: $longpaths"
+          if ($longpaths -ne "true") {
+            throw "Failed to enable git long paths"
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_hash || github.ref }}
+
+      - name: Shorten target dir to avoid MAX_PATH (Windows)
+        if: matrix.os_type == 'windows'
+        shell: powershell
+        run: |
+          # vulkan-shaders-gen ExternalProject creates deeply nested paths
+          # that exceed the 260-char Windows MAX_PATH limit when built under
+          # the default checkout path. Create a junction so the target dir
+          # physically lives at C:\t (short) while all existing path refs
+          # (apps/screenpipe-app-tauri/src-tauri/target/...) still work.
+          $targetDir = "apps\screenpipe-app-tauri\src-tauri\target"
+          $shortDir = "C:\t"
+          if (Test-Path $shortDir) { Remove-Item -Recurse -Force $shortDir }
+          New-Item -ItemType Directory -Force -Path $shortDir | Out-Null
+          if (Test-Path $targetDir) { Remove-Item -Recurse -Force $targetDir }
+          cmd /c mklink /J $targetDir $shortDir
+          Write-Host "Created junction: $targetDir -> $shortDir"
+
+      - name: Update version in Cargo.toml
+        if: github.event.inputs.commit_hash && github.event.inputs.version && matrix.platform != 'macos-latest'
+        shell: pwsh
+        run: |
+          $content = Get-Content apps/screenpipe-app-tauri/src-tauri/Cargo.toml
+          $content = $content -replace '^version = ".*"', ('version = "' + '${{ github.event.inputs.version }}' + '"')
+          $content | Set-Content apps/screenpipe-app-tauri/src-tauri/Cargo.toml -Force
+
+      - name: Update version in Cargo.toml
+        if: github.event.inputs.commit_hash && github.event.inputs.version && matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          sed -i '' 's/^version = ".*"/version = "${{ github.event.inputs.version }}"/' apps/screenpipe-app-tauri/src-tauri/Cargo.toml
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.target == 'aarch64-pc-windows-msvc' && '22' || '20' }}
+
+      - name: Set up Rust
+        if: matrix.os_type != 'windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install Rust (Windows x64)
+        if: matrix.os_type == 'windows' && matrix.target == 'x86_64-pc-windows-msvc'
+        shell: powershell
+        run: |
+          Invoke-WebRequest https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe -OutFile rustup-init.exe
+          .\rustup-init.exe -y
+
+      - name: Install Rust (Windows ARM64 native)
+        if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
+        shell: powershell
+        run: |
+          Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+          .\rustup-init.exe -y
+
+      - name: setup rust path
+        if: matrix.os_type == 'windows'
+        shell: powershell
+        run: |
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          rustc --version # verify rust is available
+
+      # sccache disabled temporarily due to GitHub Actions cache outage
+      # - name: Setup sccache
+      #   uses: mozilla-actions/sccache-action@v0.0.7
+      #   with:
+      #     version: "v0.8.2"
+
+      # - name: Configure sccache
+      #   shell: bash
+      #   run: |
+      #     echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+      #     echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Specify custom cache key
+          key: ${{ runner.os }}-rust-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          # Cache these paths
+          cache-directories: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/${{ matrix.target }}
+            apps/screenpipe-app-tauri/src-tauri/target
+          # Shared cache across branches
+          shared-key: "rust-cache-${{ matrix.target }}"
+          # Save cache even on failed builds
+          save-if: true
+
+      - name: Cache Build Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            target/${{ matrix.target }}/release
+            apps/screenpipe-app-tauri/src-tauri/target/release
+          key: ${{ runner.os }}-artifacts-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-artifacts-${{ matrix.target }}-
+
+      - name: Cache Homebrew packages
+        if: matrix.platform == 'macos-latest'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /usr/local/Cellar/ffmpeg
+            /usr/local/Cellar/pkg-config
+          key: ${{ runner.os }}-brew-${{ hashFiles('.github/workflows/release-cli.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-brew-
+
+      # Cache binary dependencies (ffmpeg, tesseract, ollama, vcredist, WixTools)
+      # These rarely change — keyed on workflow file hash, not lockfiles
+      - name: Cache Binary Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/screenpipe-app-tauri/src-tauri/ffmpeg
+            apps/screenpipe-app-tauri/src-tauri/ffmpeg-*
+            apps/screenpipe-app-tauri/src-tauri/tesseract-*
+            apps/screenpipe-app-tauri/src-tauri/WixTools
+            apps/screenpipe-app-tauri/src-tauri/vcredist
+            apps/screenpipe-app-tauri/src-tauri/ollama-*
+            apps/screenpipe-app-tauri/src-tauri/lib/ollama
+            apps/screenpipe-app-tauri/src-tauri/ui_monitor-*
+          key: ${{ matrix.platform }}-${{ matrix.target }}-bins-v1
+          restore-keys: |
+            ${{ matrix.platform }}-${{ matrix.target }}-bins-
+
+      # Cache node_modules and tauri CLI — changes with bun.lockb
+      - name: Cache Node Modules
+        id: cache-pre-build
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/screenpipe-app-tauri/node_modules
+            apps/screenpipe-app-tauri/.tauri
+            apps/screenpipe-app-tauri/src-tauri/target
+          key: ${{ matrix.platform }}-${{ matrix.target }}-node-${{ hashFiles('**/bun.lockb') }}
+          restore-keys: |
+            ${{ matrix.platform }}-${{ matrix.target }}-node-
+
+      - name: Install dependencies
+        if: matrix.os_type == 'macos'
+        shell: bash
+        run: |
+          # Ensure brew is on PATH for this step AND all subsequent steps (via GITHUB_PATH)
+          eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null || true)"
+          # Persist brew bin dirs to GITHUB_PATH so bun/pre_build.js can find wget etc.
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+          echo "/opt/homebrew/sbin" >> $GITHUB_PATH
+          brew install ffmpeg wget
+
+      - name: Install dependencies
+        if: matrix.os_type == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++ \
+            ffmpeg \
+            tesseract-ocr \
+            cmake \
+            clang \
+            libavformat-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libssl-dev \
+            libtesseract-dev \
+            libxdo-dev \
+            libsdl2-dev \
+            libclang-dev \
+            libxtst-dev \
+            libx11-dev \
+            libxext-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libgl1-mesa-dev \
+            libasound2-dev \
+            libpulse-dev \
+            curl \
+            pkg-config \
+            libsqlite3-dev \
+            libbz2-dev \
+            zlib1g-dev \
+            libonig-dev \
+            libayatana-appindicator3-dev \
+            libsamplerate-dev \
+            libwebrtc-audio-processing-dev \
+            libpipewire-0.3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf \
+            libwebkit2gtk-4.1-dev \
+            xdg-desktop-portal-gtk \
+            libsecret-1-dev \
+            libopenblas-dev
+          # antirez-asr-sys build script emits -llibopenblas (double lib prefix).
+          # Create a symlink so the linker finds it, and set OPENBLAS_PATH with lib/ subdir.
+          sudo mkdir -p /usr/lib/x86_64-linux-gnu/openblas/lib
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.so /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.so
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.a /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.a
+          echo "OPENBLAS_PATH=/usr/lib/x86_64-linux-gnu/openblas" >> $GITHUB_ENV
+
+      - name: Install frontend dependencies
+        working-directory: ${{ github.workspace }}/apps/screenpipe-app-tauri
+        run: bun install
+
+      - name: Set up MSVC
+        if: matrix.os_type == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja (ARM64)
+        if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
+        shell: powershell
+        run: |
+          winget install Ninja-build.Ninja --accept-package-agreements --accept-source-agreements --silent
+          $paths = @("C:\Program Files\Ninja", "C:\Tools\Ninja")
+          foreach ($p in $paths) {
+            if (Test-Path "$p\ninja.exe") {
+              echo $p | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              break
+            }
+          }
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          ninja --version
+
+      - name: Install wget on Windows
+        if: matrix.os_type == 'windows'
+        shell: powershell
+        env:
+          SKIP_SCREENPIPE_SETUP: true
+        run: |
+          # Remove wget alias if it exists
+          if (Test-Path Alias:wget) {
+            Remove-Item Alias:wget -Force
+          }
+
+          $wgetDir = "C:\wget"
+          # Skip download if already installed (self-hosted runners)
+          if (Test-Path "$wgetDir\wget.exe") {
+            Write-Host "wget already installed, skipping download"
+          } else {
+            New-Item -ItemType Directory -Force -Path $wgetDir
+
+            $wgetUrl = "https://eternallybored.org/misc/wget/releases/wget-1.21.4-win64.zip"
+            $wgetZip = "$wgetDir\wget.zip"
+
+            Invoke-WebRequest -Uri $wgetUrl -OutFile $wgetZip
+            Expand-Archive -Path $wgetZip -DestinationPath $wgetDir -Force
+            Remove-Item $wgetZip
+          }
+
+          # Add to PATH for current session only
+          $env:Path = "$wgetDir;$env:Path"
+
+          # Verify installation
+          & "$wgetDir\wget.exe" --version
+
+      - name: Run pre_build.js
+        run: bun ./scripts/pre_build.js ${{ matrix.pre-build-args }}
+        working-directory: ${{ github.workspace }}/apps/screenpipe-app-tauri
+
+      - name: Use production config for release
+        shell: bash
+        run: cp apps/screenpipe-app-tauri/src-tauri/tauri.prod.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+
+      - name: Set macOS deployment target
+        if: matrix.os_type == 'macos'
+        shell: bash
+        run: |
+          # aarch64 uses 14.0 because MLX Metal kernels require macOS 14+ SDK
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> $GITHUB_ENV
+            echo "Setting MACOSX_DEPLOYMENT_TARGET=14.0 for MLX Metal kernel support"
+          else
+            echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> $GITHUB_ENV
+            echo "Setting MACOSX_DEPLOYMENT_TARGET=10.15 for std::filesystem support"
+          fi
+
+      - name: Import signing cert into build keychain (macOS)
+        if: matrix.os_type == 'macos'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Use a dedicated build keychain to avoid login keychain permission
+          # issues on self-hosted runners. The login keychain approach fails with
+          # errSecInternalComponent on some runners because the security session
+          # can't update the partition list for the login keychain's private keys.
+          #
+          # A dedicated keychain with a known password avoids all these issues:
+          # we control the password, partition list, and search order.
+
+          BUILD_KC="$HOME/Library/Keychains/build.keychain-db"
+          BUILD_KC_PASS="build_password"
+
+          # Remove stale build keychain from previous runs
+          security delete-keychain "$BUILD_KC" 2>/dev/null || true
+
+          # Create fresh build keychain
+          security create-keychain -p "$BUILD_KC_PASS" "$BUILD_KC"
+          security set-keychain-settings -lut 7200 "$BUILD_KC"
+          security unlock-keychain -p "$BUILD_KC_PASS" "$BUILD_KC"
+
+          # Add build keychain to search list (prepend so it's found first)
+          EXISTING=$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
+          security list-keychains -d user -s "$BUILD_KC" $EXISTING
+
+          # Decode and import the p12
+          CERT_PATH=$(mktemp /tmp/cert.XXXXXX.p12)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/pkgbuild \
+            -T /usr/bin/productbuild \
+            -k "$BUILD_KC"
+
+          # Set partition list — we own this keychain so this always works
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$BUILD_KC_PASS" \
+            "$BUILD_KC"
+
+          rm -f "$CERT_PATH"
+
+          # Import full Apple certificate chain so codesign can verify trust.
+          # Always re-download to avoid stale/corrupt cached files.
+          mkdir -p ~/apple-certs
+
+          echo "=== Downloading Apple CA certificates ==="
+
+          # Apple Root CA
+          curl -sfL -o ~/apple-certs/AppleRootCA.cer \
+            "https://www.apple.com/appleca/AppleIncRootCertificate.cer"
+          echo "  Downloaded AppleRootCA.cer ($(wc -c < ~/apple-certs/AppleRootCA.cer) bytes)"
+
+          # Apple WWDR (Worldwide Developer Relations) G2
+          curl -sfL -o ~/apple-certs/AppleWWDRCAG2.cer \
+            "https://www.apple.com/certificateauthority/AppleWWDRCAG2.cer"
+          echo "  Downloaded AppleWWDRCAG2.cer ($(wc -c < ~/apple-certs/AppleWWDRCAG2.cer) bytes)"
+
+          # Developer ID Certification Authority (original, for pre-2024 certs)
+          curl -sfL -o ~/apple-certs/DeveloperIDCA.cer \
+            "https://www.apple.com/certificateauthority/DeveloperIDCA.cer"
+          echo "  Downloaded DeveloperIDCA.cer ($(wc -c < ~/apple-certs/DeveloperIDCA.cer) bytes)"
+
+          # Developer ID Certification Authority G2
+          curl -sfL -o ~/apple-certs/DeveloperIDG2CA.cer \
+            "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer"
+          echo "  Downloaded DeveloperIDG2CA.cer ($(wc -c < ~/apple-certs/DeveloperIDG2CA.cer) bytes)"
+
+          echo "=== Importing CA certs into build keychain ==="
+
+          # Import certs into build keychain
+          for cert in AppleRootCA AppleWWDRCAG2 DeveloperIDCA DeveloperIDG2CA; do
+            security import ~/apple-certs/${cert}.cer -t cert -k "$BUILD_KC" 2>&1 || echo "  (import ${cert}: already exists or skipped)"
+          done
+
+          # Explicitly set trust for root CA and intermediate CAs.
+          # This is critical on self-hosted runners (e.g. Mac Mini) where
+          # SystemRootCertificates.keychain may not be accessible to codesign.
+          # IMPORTANT: Use timeout because `security add-trusted-cert` hangs
+          # indefinitely on GH-hosted runners (no SecurityAgent/GUI session).
+          # On GH-hosted runners this will timeout and that's fine — they have
+          # Apple Root CA in SystemRootCertificates.keychain already.
+          echo "=== Setting trust policies ==="
+          timeout 10 security add-trusted-cert -r trustRoot -p codeSign -k "$BUILD_KC" \
+            ~/apple-certs/AppleRootCA.cer 2>&1 || echo "  (trust AppleRootCA: skipped or already set)"
+          timeout 10 security add-trusted-cert -r unspecified -p codeSign -k "$BUILD_KC" \
+            ~/apple-certs/DeveloperIDCA.cer 2>&1 || echo "  (trust DeveloperIDCA: skipped or already set)"
+          timeout 10 security add-trusted-cert -r unspecified -p codeSign -k "$BUILD_KC" \
+            ~/apple-certs/DeveloperIDG2CA.cer 2>&1 || echo "  (trust DeveloperIDG2CA: skipped or already set)"
+
+          # Ensure login keychain + System Roots are in the search list
+          security list-keychains -d user -s "$BUILD_KC" \
+            "$HOME/Library/Keychains/login.keychain-db" \
+            "/Library/Keychains/System.keychain" \
+            "/System/Library/Keychains/SystemRootCertificates.keychain"
+
+          # Verify signing identity is available and chain is valid
+          echo "=== Keychain search list ==="
+          security list-keychains -d user
+          echo "=== Signing identities ==="
+          security find-identity -v -p codesigning "$BUILD_KC" 2>&1 | tail -5
+          echo "=== Certificate chain verification ==="
+          security find-certificate -a -p "$BUILD_KC" | grep -c "BEGIN CERTIFICATE" || true
+          echo "certificates found in build keychain"
+          echo "Build keychain ready at $BUILD_KC"
+
+      - name: Compute Tauri build args
+        if: matrix.os_type == 'macos'
+        id: tauri-args
+        shell: bash
+        run: |
+          ARGS="${{ matrix.tauri-args }}"
+          if [[ "${{ steps.detect-xcode.outputs.has_apple_intelligence }}" == "true" ]]; then
+            # Append apple-intelligence to existing --features flag
+            ARGS=$(echo "$ARGS" | sed 's/--features \([^ ]*\)/--features \1,apple-intelligence/')
+            echo "🧠 Tauri build will include Apple Intelligence"
+          fi
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+          echo "Final tauri args: $ARGS"
+
+      - name: Re-unlock build keychain before signing (macOS)
+        if: matrix.os_type == 'macos'
+        shell: bash
+        run: |
+          # Re-unlock the build keychain right before tauri build to ensure it
+          # hasn't auto-locked during cargo compilation (can take 5+ minutes).
+          BUILD_KC="$HOME/Library/Keychains/build.keychain-db"
+          if [ -f "$BUILD_KC" ]; then
+            security unlock-keychain -p "build_password" "$BUILD_KC"
+            # Re-assert the keychain search list (other steps may have modified it)
+            security list-keychains -d user -s "$BUILD_KC" \
+              "$HOME/Library/Keychains/login.keychain-db" \
+              "/Library/Keychains/System.keychain" \
+              "/System/Library/Keychains/SystemRootCertificates.keychain"
+            echo "Build keychain unlocked and search list verified"
+            security find-identity -v -p codesigning "$BUILD_KC" 2>&1 | tail -3
+          fi
+
+      - name: Build (Linux)
+        if: matrix.os_type == 'linux'
+        working-directory: apps/screenpipe-app-tauri
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI: true
+          CMAKE_ARGS: -DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF
+          NO_STRIP: true
+        run: |
+          # Wrap ldd so linuxdeploy doesn't crash on the statically-linked bun sidecar.
+          # bun is built with musl and ldd exits 1 on it, which kills linuxdeploy's GTK plugin.
+          sudo mv /usr/bin/ldd /usr/bin/ldd.real
+          sudo tee /usr/bin/ldd > /dev/null << 'WRAPPER'
+          #!/bin/bash
+          if [[ "$1" == *"/bun"* ]] || [[ "$1" == *"bun-"* ]]; then
+            echo "	statically linked"
+            exit 0
+          fi
+          exec /usr/bin/ldd.real "$@"
+          WRAPPER
+          sudo chmod +x /usr/bin/ldd
+
+          # Tell linuxdeploy to deploy GTK3 plugin dependencies (bundles libsecret etc.)
+          export DEPLOY_GTK_VERSION=3
+
+          # Clean stale bundle artifacts from cache — prevents old .deb/.AppImage
+          # files from accumulating and being uploaded alongside the current version
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          echo "Cleaning stale bundle artifacts from ${BUNDLE_DIR}..."
+          rm -rf "${BUNDLE_DIR}" 2>/dev/null || true
+
+          bunx tauri build --verbose ${{ matrix.tauri-args }}
+
+          # Fix ABI mismatch: the AppImage bundles libs from Ubuntu 24.04 but
+          # on distros like Fedora 43 with newer system libs, symbols are missing
+          # (e.g. g_variant_builder_init_static in GLib, MOUNT_2_40 in libmount).
+          # Remove bundled GLib/GIO/GObject/GModule/libmount/libblkid/libpcre2
+          # so system versions are used. These are core libs on all Linux desktops.
+          echo "Removing bundled system libraries to prevent ABI mismatch on newer distros..."
+          # Install appimagetool for repacking
+          curl -fsSL -o /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+          find src-tauri/target/${{ matrix.target }}/release/bundle/appimage/ -name "*.AppImage" -exec bash -c '
+            APPIMAGE="$1"
+            echo "Patching $APPIMAGE to remove bundled GLib"
+            chmod +x "$APPIMAGE"
+            "$APPIMAGE" --appimage-extract
+            rm -f squashfs-root/usr/lib/libglib-2.0.so* \
+                  squashfs-root/usr/lib/libgobject-2.0.so* \
+                  squashfs-root/usr/lib/libgio-2.0.so* \
+                  squashfs-root/usr/lib/libgmodule-2.0.so* \
+                  squashfs-root/usr/lib/libmount.so* \
+                  squashfs-root/usr/lib/libblkid.so* \
+                  squashfs-root/usr/lib/libpcre2-8.so*
+            echo "Removed bundled GLib libs, repacking AppImage..."
+            ARCH=x86_64 /tmp/appimagetool squashfs-root "$APPIMAGE"
+            rm -rf squashfs-root
+            echo "AppImage repacked successfully"
+          ' _ {} \;
+
+      - name: Install AzureSignTool and ensure signtool on PATH (Windows)
+        if: matrix.os_type == 'windows'
+        shell: powershell
+        run: |
+          dotnet tool install --global AzureSignTool
+          # On ARM64, set TAURI_WINDOWS_SIGNTOOL_PATH to bypass Tauri's os_bitness() bug
+          # (Tauri doesn't handle ARM64 in GetNativeSystemInfo, causing "SignTool not found")
+          $target = "${{ matrix.target }}"
+          if ($target -match "aarch64") {
+            $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.DirectoryName -match "\\(arm64|x64)$" } |
+              Sort-Object { ($_.DirectoryName -replace '.*\\(\d+\.\d+\.\d+\.\d+)\\.*','$1') } -Descending |
+              Select-Object -First 1
+            if ($signtool) {
+              echo "TAURI_WINDOWS_SIGNTOOL_PATH=$($signtool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              echo "$($signtool.DirectoryName)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "Set TAURI_WINDOWS_SIGNTOOL_PATH=$($signtool.FullName)"
+            } else {
+              Write-Host "ERROR: signtool.exe not found anywhere on ARM64 runner"
+              exit 1
+            }
+          }
+
+      - name: Build (Windows)
+        if: matrix.os_type == 'windows'
+        working-directory: apps/screenpipe-app-tauri
+        shell: powershell
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI: true
+          # Azure Key Vault code signing
+          AZURE_KEY_VAULT_URI: ${{ secrets.AZURE_KEY_VAULT_URI }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ secrets.AZURE_KEY_VAULT_CERTIFICATE }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # Optimize for build speed on Windows
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "2"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          # Enable incremental compilation for Windows
+          CARGO_INCREMENTAL: "true"
+          # Windows: keep symbols for Sentry upload, macOS: none
+          CARGO_PROFILE_RELEASE_STRIP: none
+          CARGO_PROFILE_RELEASE_PANIC: abort
+          CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C link-arg=/LTCG' || '' }}
+          # Cap MSVC codegen at AVX2 — prevents LTCG from auto-vectorizing C deps
+          # (e.g. sqlite-vec) to AVX-512 on CI Xeon runners. Lunar Lake and other
+          # consumer CPUs lack AVX-512, causing STATUS_ILLEGAL_INSTRUCTION (0xc000001d).
+          # Only set for x86_64 — clang on ARM64 doesn't understand /arch:AVX2.
+          CFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '/arch:AVX2' || '' }}
+          CXXFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '/arch:AVX2' || '' }}
+          # Fix whisper.cpp crash on newer CPUs (Lunar Lake, Arrow Lake, etc.) that lack AVX-512
+          # GGML_NATIVE=ON compiles with -march=native, causing illegal instruction on CPUs without AVX-512
+          # CMAKE_C_FLAGS/CMAKE_CXX_FLAGS=/arch:AVX2 caps CMake-built deps (whisper.cpp/GGML) at AVX2.
+          # CFLAGS/CXXFLAGS only affects cc-crate builds (sqlite-vec), NOT cmake-crate builds.
+          # Without this, MSVC auto-vectorizes GGML code to AVX-512 on Xeon CI runners.
+          CMAKE_ARGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF -DCMAKE_C_FLAGS=/arch:AVX2 -DCMAKE_CXX_FLAGS=/arch:AVX2' || '-DGGML_NATIVE=OFF' }}
+          OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
+        run: bunx tauri build --verbose ${{ matrix.tauri-args }}
+
+      - name: Build (with codesign retry)
+        if: matrix.os_type == 'macos'
+        shell: bash
+        env:
+          # for updater
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          # for release
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # for macos signing — cert is pre-imported into build keychain above,
+          # so we do NOT pass APPLE_CERTIFICATE (which would create a temp keychain
+          # that conflicts with our build keychain setup)
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # https://tauri.app/v1/guides/distribution/sign-macos
+          CI: true
+          # Fix std::filesystem availability - requires macOS 10.15+
+          # whisper.cpp ggml uses std::filesystem::path which needs 10.15
+          # All these vars needed to ensure cmake picks up the deployment target
+          # Note: aarch64 uses 14.0 because MLX Metal kernels require macOS 14+ SDK
+          # (MSL features not available in older deployment targets)
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'aarch64-apple-darwin' && '14.0' || '10.15' }}
+          CMAKE_OSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'aarch64-apple-darwin' && '14.0' || '10.15' }}
+          # Fix i8mm build error - force M1 compatible architecture
+          # -U__ARM_FEATURE_MATMUL_INT8 undefines i8mm macro
+          # -mmacosx-version-min ensures std::filesystem is available
+          # See: https://github.com/ggml-org/whisper.cpp/issues/3427
+          CFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && '-mmacosx-version-min=14.0 -mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8' || '-mmacosx-version-min=10.15' }}
+          CXXFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && '-mmacosx-version-min=14.0 -mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8' || '-mmacosx-version-min=10.15' }}
+          CMAKE_C_FLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && '-mmacosx-version-min=14.0' || '-mmacosx-version-min=10.15' }}
+          CMAKE_CXX_FLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && '-mmacosx-version-min=14.0' || '-mmacosx-version-min=10.15' }}
+
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_INCREMENTAL: "false"
+          CARGO_PROFILE_RELEASE_STRIP: none
+          CARGO_PROFILE_RELEASE_PANIC: unwind
+          CARGO_PROFILE_RELEASE_INCREMENTAL: "true"
+          # Fix linuxdeploy crash on AppImage bundling
+          NO_STRIP: ${{ matrix.os_type == 'linux' && '1' || '' }}
+          LINUXDEPLOY_OUTPUT_VERSION: ${{ matrix.os_type == 'linux' && '1' || '' }}
+          APPIMAGE_EXTRACT_AND_RUN: ${{ matrix.os_type == 'linux' && '1' || '' }}
+        run: |
+          TAURI_ARGS="${{ steps.tauri-args.outputs.args || matrix.tauri-args }}"
+          MAX_ATTEMPTS=3
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+
+          # Clean stale bundle artifacts from cache — prevents old .deb/.AppImage
+          # files from accumulating and being uploaded alongside the current version
+          echo "Cleaning stale bundle artifacts..."
+          rm -rf "${BUNDLE_DIR}" 2>/dev/null || true
+
+          # Clean cached mlx-sys build — deployment target is baked into CMake cache
+          # and won't update if only the env var changes
+          echo "Cleaning mlx-sys build cache..."
+          find "apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/build" -maxdepth 1 -name "mlx-sys-*" -exec rm -rf {} + 2>/dev/null || true
+
+          # Force macOS 14.0 for MLX Metal kernels and C++ compilation.
+          # The cc crate injects --target=arm64-apple-macosx -mmacosx-version-min=10.13
+          # into CMAKE_C_FLAGS. CMake then derives CMAKE_OSX_DEPLOYMENT_TARGET=10.13,
+          # appending its own -mmacosx-version-min=10.13 AFTER our 14.0, and passing
+          # 10.13 to the Metal compiler. This breaks both MSL 3.0+ and std::filesystem.
+          # Fix: wrap cc/c++/xcrun to replace all -mmacosx-version-min flags with 14.0.
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            WRAPPER_DIR="$(pwd)/.compiler-wrapper"
+            mkdir -p "$WRAPPER_DIR"
+            for tool in cc c++ xcrun; do
+              REAL_PATH=$(which $tool)
+              printf '#!/bin/bash\nnew=(); for x in "$@"; do [[ "$x" == -mmacosx-version-min=* ]] && x="-mmacosx-version-min=14.0"; new+=("$x"); done; exec '"$REAL_PATH"' "${new[@]}"\n' > "$WRAPPER_DIR/$tool"
+              chmod +x "$WRAPPER_DIR/$tool"
+            done
+            export PATH="$WRAPPER_DIR:$PATH"
+            echo "Compiler wrappers installed: cc=$(which cc) c++=$(which c++) xcrun=$(which xcrun)"
+          fi
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "=== Build attempt $attempt/$MAX_ATTEMPTS ==="
+
+            # Re-unlock keychain before each attempt (macOS) — prevents transient codesign failures
+            if [[ "${{ matrix.os_type }}" == "macos" ]]; then
+              BUILD_KC="$HOME/Library/Keychains/build.keychain-db"
+              if [ -f "$BUILD_KC" ]; then
+                security unlock-keychain -p "build_password" "$BUILD_KC"
+                security set-keychain-settings -t 3600 "$BUILD_KC"
+                security list-keychains -d user -s "$BUILD_KC" \
+                  "$HOME/Library/Keychains/login.keychain-db" \
+                  "/Library/Keychains/System.keychain" \
+                  "/System/Library/Keychains/SystemRootCertificates.keychain"
+                echo "Keychain unlocked for attempt $attempt"
+              fi
+            fi
+
+            cd apps/screenpipe-app-tauri
+            if bunx tauri build -v $TAURI_ARGS 2>&1 | tee /tmp/tauri-build-$attempt.log; then
+              echo "✅ Build succeeded on attempt $attempt"
+              cd ../..
+              break
+            fi
+            cd ../..
+
+            if [ $attempt -eq $MAX_ATTEMPTS ]; then
+              echo "❌ Build failed after $MAX_ATTEMPTS attempts"
+              cat /tmp/tauri-build-$attempt.log | tail -50
+              exit 1
+            fi
+
+            # Check if it's a transient signing/bundling failure (worth retrying)
+            if grep -qiE "failed to sign|codesign.*failed|errSecInternalComponent|failed to bundle|CSSMERR|SecKeychainOpen" /tmp/tauri-build-$attempt.log; then
+              echo "⚠️ Transient codesign/bundle failure detected, retrying..."
+              # Clean only bundle output — cargo cache is still warm
+              find "$BUNDLE_DIR" -type f -delete 2>/dev/null || true
+              sleep $((attempt * 30))
+            else
+              echo "❌ Non-transient build failure, aborting"
+              cat /tmp/tauri-build-$attempt.log | tail -50
+              exit 1
+            fi
+          done
+
+      - name: Clean up signing cert from login keychain (macOS)
+        if: matrix.os_type == 'macos' && always()
+        shell: bash
+        run: |
+          # Remove build keychain to avoid accumulating certs across builds
+          BUILD_KC="$HOME/Library/Keychains/build.keychain-db"
+          security delete-keychain "$BUILD_KC" 2>/dev/null || true
+          security list-keychain -d user -s ~/Library/Keychains/login.keychain-db 2>/dev/null || true
+
+      - name: Notarize and staple DMGs (macOS)
+        if: matrix.os_type == 'macos'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+
+          echo "=== Notarizing and stapling DMGs ==="
+          for dmg in "${BUNDLE_DIR}"/dmg/*.dmg; do
+            if [ -f "$dmg" ]; then
+              echo "Notarizing: $(basename "$dmg")"
+              xcrun notarytool submit "$dmg" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                --wait --timeout 15m
+
+              echo "Stapling: $(basename "$dmg")"
+              xcrun stapler staple "$dmg"
+
+              echo "Verifying: $(basename "$dmg")"
+              xcrun stapler validate "$dmg"
+              spctl --assess --type open --context context:primary-signature --verbose "$dmg" 2>&1 || true
+              echo "✅ $(basename "$dmg") notarized and stapled"
+            fi
+          done
+
+      - name: Upload to Cloudflare R2 (macOS)
+        if: matrix.os_type == 'macos'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          # Upload helper: tries aws s3 cp first, falls back to curl.
+          # The self-hosted macOS ARM runner has broken LibreSSL 3.3.6 that causes
+          # SSLV3_ALERT_BAD_RECORD_MAC on large uploads to R2. Both aws cli (Python SSL)
+          # and system curl (LibreSSL) are affected. Use homebrew curl (OpenSSL 3.6.1)
+          # as the reliable fallback.
+          CURL_BIN="/opt/homebrew/opt/curl/bin/curl"
+          if [ ! -x "$CURL_BIN" ]; then
+            CURL_BIN="curl"  # fallback to system curl on non-macOS
+          fi
+          upload_with_retry() {
+            local src="$1" dst="$2"
+            local bucket_path="${dst#s3://}"
+            local r2_key="${bucket_path#*/}"
+            local bucket="${bucket_path%%/*}"
+
+            # Try aws cli first
+            for attempt in 1 2 3; do
+              if AWS_MAX_ATTEMPTS=3 aws s3 cp "$src" "$dst" \
+                  --endpoint-url "$R2_ENDPOINT" \
+                  --no-verify-ssl \
+                  --no-progress \
+                  --expected-size "$(stat -f%z "$src" 2>/dev/null || stat -c%s "$src" 2>/dev/null)" \
+                  --cli-read-timeout 300 --cli-connect-timeout 30 \
+                  --region auto 2>&1; then
+                echo "  ✅ $(basename "$src") (aws)"
+                return 0
+              fi
+              echo "  ⚠️ aws attempt $attempt failed for $(basename "$src")"
+              sleep $((attempt * 5))
+            done
+
+            # Fallback: curl with S3 v4 signing (uses macOS SecureTransport, bypasses Python SSL)
+            echo "  🔄 falling back to curl for $(basename "$src")..."
+            local content_type="application/octet-stream"
+            local date_stamp=$(date -u +%Y%m%d)
+            local amz_date=$(date -u +%Y%m%dT%H%M%SZ)
+            local region="auto"
+            local service="s3"
+            local host="${R2_ENDPOINT#https://}"
+
+            sign_and_upload() {
+              local method="PUT"
+              local canonical_uri="/${r2_key}"
+              local content_sha256=$(shasum -a 256 "$src" | awk '{print $1}')
+              local canonical_headers="content-type:${content_type}\nhost:${host}\nx-amz-content-sha256:${content_sha256}\nx-amz-date:${amz_date}\n"
+              local signed_headers="content-type;host;x-amz-content-sha256;x-amz-date"
+              local canonical_request="${method}\n${canonical_uri}\n\n${canonical_headers}\n${signed_headers}\n${content_sha256}"
+              local cr_hash=$(printf "${canonical_request}" | shasum -a 256 | awk '{print $1}')
+              local scope="${date_stamp}/${region}/${service}/aws4_request"
+              local string_to_sign="AWS4-HMAC-SHA256\n${amz_date}\n${scope}\n${cr_hash}"
+
+              local k_date=$(printf "${date_stamp}" | openssl dgst -sha256 -hex -mac HMAC -macopt "key:AWS4${AWS_SECRET_ACCESS_KEY}" | awk '{print $NF}')
+              local k_region=$(printf "${region}" | openssl dgst -sha256 -hex -mac HMAC -macopt "hexkey:${k_date}" | awk '{print $NF}')
+              local k_service=$(printf "${service}" | openssl dgst -sha256 -hex -mac HMAC -macopt "hexkey:${k_region}" | awk '{print $NF}')
+              local k_signing=$(printf "aws4_request" | openssl dgst -sha256 -hex -mac HMAC -macopt "hexkey:${k_service}" | awk '{print $NF}')
+              local signature=$(printf "${string_to_sign}" | openssl dgst -sha256 -hex -mac HMAC -macopt "hexkey:${k_signing}" | awk '{print $NF}')
+
+              local auth="AWS4-HMAC-SHA256 Credential=${AWS_ACCESS_KEY_ID}/${scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+
+              $CURL_BIN -fSs --retry 3 --retry-delay 5 \
+                -X PUT \
+                -H "Content-Type: ${content_type}" \
+                -H "x-amz-date: ${amz_date}" \
+                -H "x-amz-content-sha256: ${content_sha256}" \
+                -H "Authorization: ${auth}" \
+                --data-binary "@${src}" \
+                "${R2_ENDPOINT}/${r2_key}"
+            }
+
+            for attempt in 1 2 3; do
+              if sign_and_upload 2>&1; then
+                echo "  ✅ $(basename "$src") (curl)"
+                return 0
+              fi
+              echo "  ⚠️ curl attempt $attempt failed for $(basename "$src")"
+              sleep $((attempt * 10))
+            done
+            echo "  ❌ failed to upload $(basename "$src") after all attempts"
+            return 1
+          }
+
+          VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          R2_PREFIX="s3://screenpipe-releases/releases/${VERSION}/${TARGET}"
+
+          echo "uploading ${TARGET} bundles for v${VERSION} to R2..."
+          echo "aws cli: $(aws --version)"
+
+          # Clean any stale artifacts from previous (failed) runs for this version+target
+          echo "cleaning stale R2 artifacts at ${R2_PREFIX}/ ..."
+          aws s3 rm "${R2_PREFIX}/" --recursive --endpoint-url "$R2_ENDPOINT" --no-verify-ssl 2>/dev/null || true
+
+          UPLOAD_FAILED=0
+
+          # Upload DMG
+          for f in "${BUNDLE_DIR}"/dmg/*.dmg; do
+            [ -f "$f" ] && { upload_with_retry "$f" "${R2_PREFIX}/$(basename "$f")" || UPLOAD_FAILED=1; }
+          done
+
+          # Upload updater artifacts (.tar.gz + .sig)
+          for f in "${BUNDLE_DIR}"/macos/*.tar.gz "${BUNDLE_DIR}"/macos/*.sig; do
+            [ -f "$f" ] && { upload_with_retry "$f" "${R2_PREFIX}/$(basename "$f")" || UPLOAD_FAILED=1; }
+          done
+
+          if [ "$UPLOAD_FAILED" -eq 1 ]; then
+            echo "❌ Some uploads failed — marking step as failed"
+            exit 1
+          fi
+          echo "R2 upload complete for ${TARGET}"
+
+      - name: Upload to Cloudflare R2 (Windows)
+        if: matrix.os_type == 'windows'
+        shell: powershell
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          # Install AWS CLI if not present
+          if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing AWS CLI..."
+            Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "$env:TEMP\awscli.msi"
+            Start-Process msiexec.exe -Wait -ArgumentList "/i $env:TEMP\awscli.msi /quiet"
+            $env:PATH += ";C:\Program Files\Amazon\AWSCLIV2"
+          }
+          $version = (Select-String -Path apps/screenpipe-app-tauri/src-tauri/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $bundleDir = "apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle"
+          $r2Endpoint = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          $r2Prefix = "s3://screenpipe-releases/releases/$version/${{ matrix.target }}"
+
+          Write-Host "uploading Windows bundles for v$version to R2..."
+
+          # Clean any stale artifacts from previous (failed) runs for this version+target
+          Write-Host "cleaning stale R2 artifacts at $r2Prefix/ ..."
+          aws s3 rm "$r2Prefix/" --recursive --endpoint-url $r2Endpoint 2>$null
+
+          # Upload ALL bundle artifacts (.exe, .nsis.zip, .sig files)
+          Write-Host "Files in nsis bundle dir:"
+          Get-ChildItem "$bundleDir/nsis" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "  found: $($_.Name) ($($_.Length) bytes)"
+          }
+          Get-ChildItem "$bundleDir/nsis" -ErrorAction SilentlyContinue | ForEach-Object {
+            aws s3 cp $_.FullName "$r2Prefix/$($_.Name)" --endpoint-url $r2Endpoint
+            Write-Host "  ✅ $($_.Name)"
+          }
+
+          Write-Host "R2 upload complete for Windows"
+
+      - name: Upload to Cloudflare R2 (Linux)
+        if: matrix.os_type == 'linux'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          R2_PREFIX="s3://screenpipe-releases/releases/${VERSION}/${TARGET}"
+
+          echo "uploading Linux bundles for v${VERSION} to R2..."
+
+          # Clean any stale artifacts from previous (failed) runs for this version+target
+          echo "cleaning stale R2 artifacts at ${R2_PREFIX}/ ..."
+          aws s3 rm "${R2_PREFIX}/" --recursive --endpoint-url "$R2_ENDPOINT" --no-verify-ssl 2>/dev/null || true
+
+          echo "bundle dir contents:"
+          find "${BUNDLE_DIR}" -type f 2>/dev/null || echo "  (bundle dir not found)"
+
+          UPLOADED=0
+
+          # Upload AppImage
+          for f in "${BUNDLE_DIR}"/appimage/*.AppImage; do
+            [ -f "$f" ] && aws s3 cp "$f" "${R2_PREFIX}/$(basename "$f")" --endpoint-url "$R2_ENDPOINT" && echo "  ✅ $(basename "$f")" && UPLOADED=$((UPLOADED+1))
+          done
+
+          # Upload deb
+          for f in "${BUNDLE_DIR}"/deb/*.deb; do
+            [ -f "$f" ] && aws s3 cp "$f" "${R2_PREFIX}/$(basename "$f")" --endpoint-url "$R2_ENDPOINT" && echo "  ✅ $(basename "$f")" && UPLOADED=$((UPLOADED+1))
+          done
+
+          # Upload updater artifacts (.tar.gz + .sig) if present
+          for f in "${BUNDLE_DIR}"/appimage/*.tar.gz "${BUNDLE_DIR}"/appimage/*.sig; do
+            [ -f "$f" ] && aws s3 cp "$f" "${R2_PREFIX}/$(basename "$f")" --endpoint-url "$R2_ENDPOINT" && echo "  ✅ $(basename "$f")" && UPLOADED=$((UPLOADED+1))
+          done
+
+          if [ "$UPLOADED" -eq 0 ]; then
+            echo "❌ No Linux artifacts found to upload!"
+            exit 1
+          fi
+
+          echo "R2 upload complete for Linux ($UPLOADED files)"
+
+      # Sentry uploads run AFTER R2 so they don't delay release artifacts
+      - name: Upload debug symbols to Sentry (Windows)
+        if: matrix.os_type == 'windows'
+        continue-on-error: true
+        shell: powershell
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: mediar
+          SENTRY_ARCH: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'aarch64' || 'x86_64' }}
+        run: |
+          Invoke-WebRequest -Uri "https://release-registry.services.sentry.io/apps/sentry-cli/latest?response=download&arch=$env:SENTRY_ARCH&platform=Windows&package=sentry-cli" -OutFile sentry-cli.exe
+          Write-Host "Uploading debug symbols to Sentry..."
+          .\sentry-cli.exe debug-files upload --org $env:SENTRY_ORG --project screenpipe-app apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/
+
+      - name: Upload debug symbols to Sentry (macOS)
+        if: matrix.os_type == 'macos'
+        continue-on-error: true
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: mediar
+        run: |
+          if ! command -v sentry-cli &> /dev/null; then
+            curl -sL https://sentry.io/get-cli/ | bash
+          fi
+          echo "Uploading debug symbols to Sentry..."
+          sentry-cli debug-files upload --org $SENTRY_ORG --project screenpipe-app apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/
+
+  generate-changelog:
+    needs: [check_commit, publish-tauri]
+    if: github.event_name == 'workflow_dispatch' || needs.check_commit.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+
+      - name: Get version and previous bump
+        id: params
+        run: |
+          VERSION=$(grep '^version = ' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=v${VERSION}" >> $GITHUB_OUTPUT
+
+          # Find the previous "Bump" or "release-app" commit to diff from
+          PREV=$(git log --oneline --skip=1 --grep="release-app\|Bump app" -1 --format="%H" 2>/dev/null || echo "")
+          if [ -z "$PREV" ]; then
+            PREV="HEAD~50"
+          fi
+          echo "since=${PREV}" >> $GITHUB_OUTPUT
+          echo "Changelog: v${VERSION} since ${PREV}"
+
+      - name: Trigger changelog generation on website repo
+        uses: peter-evans/repository-dispatch@v3
+        continue-on-error: true
+        with:
+          token: ${{ secrets.WEBSITE_REPO_TOKEN }}
+          repository: screenpipe/website
+          event-type: generate-changelog
+          client-payload: '{"version": "${{ steps.params.outputs.version }}", "since": "${{ steps.params.outputs.since }}"}'
