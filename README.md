@@ -52,6 +52,14 @@ Run everything on a single, powerful machine in an all-in-one loop.
 ./screenpipe record
 ```
 
+### Advanced: Using Local LLMs (LM Studio / Ollama)
+If you prefer running your own local AI for transcription instead of the bundled Whisper model, configure the processing server via the CLI. For example, if you run LM Studio locally on port 1234:
+```bash
+./screenpipe record --mode process-only --queue-dir /Volumes/shared/queue \
+  --audio-transcription-engine openai-compatible \
+  --openai-compatible-endpoint http://localhost:1234/v1
+```
+
 ## Core Features
 
 - **Event-Driven Visual Capture:** Smart frame comparison ensures we only save frames when the screen actually changes.
