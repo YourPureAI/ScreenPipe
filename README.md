@@ -37,12 +37,23 @@ Run this on your everyday laptop. It will capture frames and audio, detect chang
 ```bash
 ./screenpipe.exe record --mode capture-only --queue-dir z:\shared\screenpipe-queue
 ```
+**📥 [Download the latest compiled Thin Client (Windows x86_64)](https://github.com/YourPureAI/ScreenPipe/actions/runs/23915655851)**
 
 ### 2. The Processing Server (Process Only)
 Run this on your powerful server (e.g., Mac Mini, PC with GPU). It polls the shared queue directory, runs Whisper (speech-to-text) and OCR (image-to-text), and populates your local SQLite database.
 ```bash
 ./screenpipe record --mode process-only --queue-dir /Volumes/shared/screenpipe-queue
 ```
+
+**Using Local LLMs (LM Studio / Ollama):**
+If you prefer running your own local AI for transcription instead of the bundled Whisper model, configure the processing server via the CLI. You can specify the endpoint and the exact model name. For example, if you run LM Studio locally on port 1234:
+```bash
+./screenpipe record --mode process-only --queue-dir /Volumes/shared/screenpipe-queue \
+  --audio-transcription-engine openai-compatible \
+  --openai-compatible-endpoint http://localhost:1234/v1 \
+  --audio-transcription-model base
+```
+
 **📥 [Download the latest compiled Processing Server (macOS Apple Silicon)](https://github.com/YourPureAI/ScreenPipe/actions/runs/23941866739)**
 
 ### 3. Local Mode (Original Behavior)
@@ -51,14 +62,6 @@ Run everything on a single, powerful machine in an all-in-one loop.
 ./screenpipe record --mode local
 # or simply:
 ./screenpipe record
-```
-
-### Advanced: Using Local LLMs (LM Studio / Ollama)
-If you prefer running your own local AI for transcription instead of the bundled Whisper model, configure the processing server via the CLI. For example, if you run LM Studio locally on port 1234:
-```bash
-./screenpipe record --mode process-only --queue-dir /Volumes/shared/queue \
-  --audio-transcription-engine openai-compatible \
-  --openai-compatible-endpoint http://localhost:1234/v1
 ```
 
 ## Core Features
