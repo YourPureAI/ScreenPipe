@@ -1,0 +1,78 @@
+name: Build macOS CLI
+
+on:
+  workflow_dispatch:
+
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
+jobs:
+  build-macos:
+    name: Build screenpipe-engine (macOS Apple Silicon)
+    runs-on: macos-14 # This uses Apple Silicon M1 runner on GitHub Actions
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install macOS Dependencies
+        run: |
+          brew update
+          brew install ffmpeg pkg-config jq wget
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+          override: true
+
+      - name: Cache default rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-cargo-
+
+      - name: Build screenpipe-engine
+        env:
+          COREAUDIO_SDK_PATH: /System/Library/Frameworks/CoreAudio.framework
+          APPLE_SILICON: true   
+        run: cargo build --release --target aarch64-apple-darwin --package screenpipe-engine
+
+      - name: Read version from Cargo.toml
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [[ -z "$VERSION" ]]; then VERSION="0.0.0"; fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Version: $VERSION"
+
+      - name: Create release package (.zip)
+        run: |
+          PKG="screenpipe-${VERSION}-aarch64-apple-darwin"
+          mkdir -p $PKG/bin
+          
+          # Copy main binary
+          cp target/aarch64-apple-darwin/release/screenpipe $PKG/bin/
+          
+          # Bundle mlx.metallib next to CLI binary (macOS aarch64 only)
+          # MLX searches for mlx.metallib next to the binary at runtime.
+          curl -L -f -o $PKG/bin/mlx.metallib \
+            "https://github.com/screenpipe/screenpipe/releases/download/mlx-metallib-v0.2.0/mlx.metallib" \
+            && echo "Bundled mlx.metallib successfully" \
+            || { echo "Failed to download mlx.metallib"; exit 1; }
+
+          # Zip it up without absolute paths
+          zip -r $PKG.zip $PKG
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenpipe-macos-${{ env.VERSION }}
+          path: screenpipe-*-aarch64-apple-darwin.zip
+          retention-days: 30
