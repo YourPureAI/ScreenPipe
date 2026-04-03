@@ -1,7 +1,7 @@
 name: Windows E2E Tests
 
 on:
-  push:
+# push:
     branches: [main]
   # Manual trigger
   workflow_dispatch:

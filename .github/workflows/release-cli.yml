@@ -6,7 +6,7 @@
 name: Release CLI
 
 on:
-  push:
+# push:
     tags:
       - "v*"
     branches:

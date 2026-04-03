@@ -65,6 +65,8 @@ We provide a dedicated GitHub Actions workflow to auto-build the lightweight Win
 2. Select the `Build Windows CLI` workflow.
 3. Download the zipped artifact containing `screenpipe.exe` and necessary runtime dlls.
 
+**📥 [Download the latest compiled Thin Client (Windows x86_64)](https://github.com/YourPureAI/ScreenPipe/actions/runs/23915655851)**
+
 ---
 
 ## Acknowledgements

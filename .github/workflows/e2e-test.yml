@@ -7,9 +7,9 @@ env:
   CARGO_PROFILE_DEV_CODEGEN_UNITS: "16"
 
 on:
-  push:
+# push:
     branches: [main]
-  pull_request:
+# pull_request:
     branches: [main]
   workflow_dispatch:
 
