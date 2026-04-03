@@ -42,6 +42,7 @@ jobs:
       - name: Build screenpipe-engine
         env:
           APPLE_SILICON: true   
+          RUSTFLAGS: "-A unexpected_cfgs"
         run: cargo build --release --target aarch64-apple-darwin --package screenpipe-engine
 
       - name: Read version from Cargo.toml
