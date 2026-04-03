@@ -41,7 +41,6 @@ jobs:
 
       - name: Build screenpipe-engine
         env:
-          COREAUDIO_SDK_PATH: /System/Library/Frameworks/CoreAudio.framework
           APPLE_SILICON: true   
         run: cargo build --release --target aarch64-apple-darwin --package screenpipe-engine
 
