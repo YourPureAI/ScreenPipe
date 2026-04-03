@@ -43,6 +43,7 @@ Run this on your powerful server (e.g., Mac Mini, PC with GPU). It polls the sha
 ```bash
 ./screenpipe record --mode process-only --queue-dir /Volumes/shared/screenpipe-queue
 ```
+**📥 [Download the latest compiled Processing Server (macOS Apple Silicon)](https://github.com/YourPureAI/ScreenPipe/actions/runs/23941866739)**
 
 ### 3. Local Mode (Original Behavior)
 Run everything on a single, powerful machine in an all-in-one loop.
